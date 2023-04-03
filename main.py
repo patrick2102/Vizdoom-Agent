@@ -7,13 +7,14 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import vizdoom as vzd
+import Agent
 import Models
 from collections import deque
 import random
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
-from multiprocessing import Process, Queue
-
+from multiprocessing import Process, Queue, Lock, Manager
+import copy
 from Agent import HyperParameters, DQNAgent, ActorCriticAgent, ActorCriticAgentPPO, ActorCriticAgentPPOLSTM
 
 # Hyperparameters
@@ -21,24 +22,22 @@ gamma = 0.99
 num_episodes = 10000
 replay_memory_size = 5000
 rollout_size = 1000
-minibatch_size = 256
+minibatch_size = 32
 #rollout_size = minibatch_size*5
 epsilon_start = 1.0
 epsilon_end = 0.01
 epsilon_decay = 0.9995
 tics_per_action = 12
 train_after_episodes = 100
-training_epochs = 50
+training_epochs = 10
 replay_memory = deque(maxlen=replay_memory_size)
 downscale = (45, 30)
 
 save_model_freq = 100
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda:0"
+shutdown = False
 
-def preprocess(state):
+def preprocess(state, device):
     state = cv2.resize(state, downscale, interpolation=cv2.INTER_AREA)
 
     # Display the resized state
@@ -58,7 +57,6 @@ def get_DQNAgent(num_actions):
     # Initialize DQN and target networks
 
     model_name = "DQNConv"
-
 
     policy_net = Models.DQNConv(num_actions).float().to(device)
     target_net = Models.DQNConv(num_actions).float().to(device)
@@ -133,12 +131,12 @@ def get_ActorCriticPPO(num_actions):
     agent = ActorCriticAgentPPO(actorCriticModel, model_name, hyperParameters)
     return agent
 
-def get_ActorCriticPPOLSTM(num_actions):
+def get_ActorCriticPPOLSTM(num_actions, device):
     game = vzd.DoomGame()
 
     model_name = "ActorCriticPPOLSTM"
 
-    actorCriticModel = Models.ActorCriticModelLSTM(num_actions).float().to(device)
+    actorCriticModel = Models.ActorCriticModelLSTM(num_actions, device).float().to(device)
 
     # if model exists, load it
     if os.path.exists("models/"+model_name + ".pth"):
@@ -159,6 +157,8 @@ def get_ActorCriticPPOLSTM(num_actions):
     # Initialize agent
     agent = ActorCriticAgentPPOLSTM(actorCriticModel, model_name, hyperParameters)
     return agent
+
+
 
 def TrainActorCritic():
     # Create VizDoom environment
@@ -328,74 +328,52 @@ def TrainActorCriticPPO():
     game.close()
     writer.close()
 
+def update_local_model(local_model, shared_state_dict, lock):
+    with lock:
+        local_model.load_state_dict(shared_state_dict.copy())
+
 def TrainActorCriticPPOLSTM():
     # Create VizDoom environment
     game = vzd.DoomGame()
     game.load_config("scenarios/basic.cfg")
-    game.init()
-
-    global_step = 0
+    #game.init()
 
     num_actions = game.get_available_buttons_size()
     actions = [list(a) for a in it.product([0, 1], repeat=num_actions)]
 
-    epsilon = epsilon_start
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
 
-    agent = get_ActorCriticPPOLSTM(len(actions))
+    agent = get_ActorCriticPPOLSTM(len(actions), device)
 
     #writer = SummaryWriter()
     now = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = f"runs/{agent.model_name}_{now}"
     writer = SummaryWriter(log_dir=log_dir)
 
+    num_agents = 1
+    shared_queue = Queue(maxsize=64)
+    processes = []
+
+    manager = Manager()
+    shared_state_dict = manager.dict(agent.model.state_dict())
+    update_lock = Lock()
+
+    for i in range(num_agents):
+        p = Process(target=RunAgent, args=(agent.model, shared_queue, shared_state_dict, update_lock, "cpu"))
+        p.start()
+        processes.append(p)
+
+    rollout = []
+
     for episode in range(num_episodes):
-        game.new_episode()
-        done = False
-        rollout = []
-        rollout_idx = 0
-        episode_length = 0
-        time_step = 0
-        max_time_step = 4
+        # Collect episodes until there is enough for a minibatch
+        while len(rollout) < minibatch_size:
+            rollout.append(shared_queue.get())
 
-        #prev_frames = deque([(4, 1, 45, 30)], maxlen=4)
-        prev_frames = torch.zeros(1, max_time_step, 45, 30, dtype=torch.float32).to(device)
-        frame = preprocess(game.get_state().screen_buffer)
-        prev_frames[:, -1, :, :] = frame
-        state = prev_frames.detach()
-
-        while not done:
-            # Perform action and get next state
-            action_idx, prop_dist = agent.get_action(state)
-            action = actions[action_idx]
-            reward = game.make_action(action, tics_per_action)
-            done = game.is_episode_finished()
-
-            if not done:
-                frame = preprocess(game.get_state().screen_buffer)
-            else:
-                frame = torch.zeros(downscale, dtype=torch.float32).to(device)
-                frame = torch.unsqueeze(frame, 0)
-
-            # Move frames forward
-            prev_frames = torch.roll(prev_frames, -1, 1)
-            prev_frames[:, -1, :, :] = frame
-
-            # add frame to prev_frames
-
-            next_state = prev_frames.detach()
-
-            # Save experience to replay memory
-            prop_dist = prop_dist[action_idx]
-
-            if rollout_idx < rollout_size:
-                rollout.append((state, action_idx, reward, next_state, done, prop_dist))
-            else:
-                rollout[rollout_idx % rollout_size] = (state, action_idx, reward, next_state, done, prop_dist)
-
-            rollout_idx += 1
-
-            state = next_state
-
+        # Train the model using the rollout
         al, cl = 0.0, 0.0
         for epoch in range(training_epochs):
             random.shuffle(rollout)
@@ -405,21 +383,27 @@ def TrainActorCriticPPOLSTM():
                 al += actor_loss
                 cl += critic_loss
 
+
         al /= training_epochs
         cl /= training_epochs
-        global_step += 1
-        writer.add_scalar("Actor Loss", al, global_step)
-        writer.add_scalar("Critic Loss", cl, global_step)
+
+        average_reward = sum([element[2] for element in rollout])
+
+        writer.add_scalar("Actor Loss", al, episode)
+        writer.add_scalar("Critic Loss", cl, episode)
+        writer.add_scalar("Average Reward", average_reward, episode)
+
+        rollout = []
 
         if episode % save_model_freq == 0:
             torch.save(agent.model.state_dict(), f"models/{agent.model_name}.pth")
             print("Saved model!")
 
+        #with update_lock:
+        #    shared_state_dict.update(agent.model.state_dict())
 
-        # Print episode results
-        print(f"Episode: {episode}, Total Reward: {game.get_total_reward()}, Epsilon: {epsilon}")
-        writer.add_scalar("Total Reward", game.get_total_reward(), episode)
-
+    for p in processes:
+        p.terminate()
 
     game.close()
     writer.close()
@@ -499,6 +483,66 @@ def main():
 
     game.close()
     writer.close()
+
+def RunAgent(global_model, shared_queue, shared_state_dict, update_lock, device):
+    game = vzd.DoomGame()
+    game.load_config("scenarios/basic.cfg")
+    game.init()
+    num_actions = game.get_available_buttons_size()
+    actions = [list(a) for a in it.product([0, 1], repeat=num_actions)]
+    max_time_step = 4
+
+    local_model = copy.deepcopy(global_model).to(device)
+
+    #local_model = global_model.deepcopy().to(device)
+    #local_model.to(device)
+    local_model.device = device
+    #update_local_model(local_model, shared_state_dict, update_lock)
+    update_freq = 10
+    episode = 0
+
+    while not shutdown:
+        game.new_episode()
+        prev_frames = torch.zeros(1, max_time_step, 45, 30, dtype=torch.float32).cpu()
+        frame = preprocess(game.get_state().screen_buffer, device)
+        prev_frames[:, -1, :, :] = frame
+        state = prev_frames.detach()
+        done = False
+        while not done:
+            # Perform action and get next state
+            with torch.no_grad():
+                prop_dist, state_value = local_model.forward(state)
+            action_idx = torch.argmax(prop_dist).item()
+            action = actions[action_idx]
+            reward = game.make_action(action, tics_per_action)
+            done = game.is_episode_finished()
+
+            if not done:
+                frame = preprocess(game.get_state().screen_buffer, device)
+            else:
+                frame = torch.zeros(downscale, dtype=torch.float32).to(device)
+                frame = torch.unsqueeze(frame, 0)
+
+            # Move frames forward
+            prev_frames = torch.roll(prev_frames, -1, 1)
+            prev_frames[:, -1, :, :] = frame
+
+            # add frame to prev_frames
+            next_state = prev_frames.detach()
+
+            # Save experience to replay memory
+            prop_dist = prop_dist[action_idx]
+
+            shared_queue.put((state, action_idx, reward, next_state, done, prop_dist))
+
+            state = next_state
+        episode += 1
+        #update_local_model(local_model, shared_state_dict, update_lock)
+        local_model = copy.deepcopy(global_model).to(device)
+        local_model.device = device
+        print("Model updated!")
+
+
 
 
 #Dictionary to handle command line arguments:

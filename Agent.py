@@ -1,14 +1,5 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
-import vizdoom as vzd
-import Models
-from collections import deque
-import random
-from torch.utils.tensorboard import SummaryWriter
-
-import main
+import torch
 
 
 class HyperParameters:
