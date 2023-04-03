@@ -12,8 +12,9 @@ from collections import deque
 import random
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+from multiprocessing import Process, Queue
 
-from Agent import HyperParameters, DQNAgent, ActorCriticAgent, ActorCriticAgentPPO
+from Agent import HyperParameters, DQNAgent, ActorCriticAgent, ActorCriticAgentPPO, ActorCriticAgentPPOLSTM
 
 # Hyperparameters
 gamma = 0.99
@@ -27,7 +28,7 @@ epsilon_end = 0.01
 epsilon_decay = 0.9995
 tics_per_action = 12
 train_after_episodes = 100
-training_epochs = 10
+training_epochs = 50
 replay_memory = deque(maxlen=replay_memory_size)
 downscale = (45, 30)
 
@@ -132,6 +133,33 @@ def get_ActorCriticPPO(num_actions):
     agent = ActorCriticAgentPPO(actorCriticModel, model_name, hyperParameters)
     return agent
 
+def get_ActorCriticPPOLSTM(num_actions):
+    game = vzd.DoomGame()
+
+    model_name = "ActorCriticPPOLSTM"
+
+    actorCriticModel = Models.ActorCriticModelLSTM(num_actions).float().to(device)
+
+    # if model exists, load it
+    if os.path.exists("models/"+model_name + ".pth"):
+        actorCriticModel.load_state_dict(torch.load("models/"+model_name + ".pth"), strict=False)
+        print("Loaded model")
+
+    learning_rates = [{'params': actorCriticModel.conv1.parameters(), 'lr': 1e-4},
+                      {'params': actorCriticModel.conv2.parameters(), 'lr': 1e-4},
+                      {'params': actorCriticModel.conv3.parameters(), 'lr': 1e-4},
+                      {'params': actorCriticModel.lstm.parameters(), 'lr': 1e-4},
+                      {'params': actorCriticModel.actor.parameters(), 'lr': 1e-4},
+                      {'params': actorCriticModel.critic.parameters(), 'lr': 1e-4}]
+    optimizer = optim.Adam(learning_rates)
+
+    criterion = nn.MSELoss().to(device)
+    # Initialize hyperparameters
+    hyperParameters = HyperParameters(optimizer=optimizer, criterion=criterion)
+    # Initialize agent
+    agent = ActorCriticAgentPPOLSTM(actorCriticModel, model_name, hyperParameters)
+    return agent
+
 def TrainActorCritic():
     # Create VizDoom environment
     game = vzd.DoomGame()
@@ -144,10 +172,7 @@ def TrainActorCritic():
     actions = [list(a) for a in it.product([0, 1], repeat=num_actions)]
 
     epsilon = epsilon_start
-
     agent = get_ActorCritic(len(actions))
-
-    #writer = SummaryWriter()
     now = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = f"runs/{agent.model_name}_{now}"
     writer = SummaryWriter(log_dir=log_dir)
@@ -303,6 +328,102 @@ def TrainActorCriticPPO():
     game.close()
     writer.close()
 
+def TrainActorCriticPPOLSTM():
+    # Create VizDoom environment
+    game = vzd.DoomGame()
+    game.load_config("scenarios/basic.cfg")
+    game.init()
+
+    global_step = 0
+
+    num_actions = game.get_available_buttons_size()
+    actions = [list(a) for a in it.product([0, 1], repeat=num_actions)]
+
+    epsilon = epsilon_start
+
+    agent = get_ActorCriticPPOLSTM(len(actions))
+
+    #writer = SummaryWriter()
+    now = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = f"runs/{agent.model_name}_{now}"
+    writer = SummaryWriter(log_dir=log_dir)
+
+    for episode in range(num_episodes):
+        game.new_episode()
+        done = False
+        rollout = []
+        rollout_idx = 0
+        episode_length = 0
+        time_step = 0
+        max_time_step = 4
+
+        #prev_frames = deque([(4, 1, 45, 30)], maxlen=4)
+        prev_frames = torch.zeros(1, max_time_step, 45, 30, dtype=torch.float32).to(device)
+        frame = preprocess(game.get_state().screen_buffer)
+        prev_frames[:, -1, :, :] = frame
+        state = prev_frames.detach()
+
+        while not done:
+            # Perform action and get next state
+            action_idx, prop_dist = agent.get_action(state)
+            action = actions[action_idx]
+            reward = game.make_action(action, tics_per_action)
+            done = game.is_episode_finished()
+
+            if not done:
+                frame = preprocess(game.get_state().screen_buffer)
+            else:
+                frame = torch.zeros(downscale, dtype=torch.float32).to(device)
+                frame = torch.unsqueeze(frame, 0)
+
+            # Move frames forward
+            prev_frames = torch.roll(prev_frames, -1, 1)
+            prev_frames[:, -1, :, :] = frame
+
+            # add frame to prev_frames
+
+            next_state = prev_frames.detach()
+
+            # Save experience to replay memory
+            prop_dist = prop_dist[action_idx]
+
+            if rollout_idx < rollout_size:
+                rollout.append((state, action_idx, reward, next_state, done, prop_dist))
+            else:
+                rollout[rollout_idx % rollout_size] = (state, action_idx, reward, next_state, done, prop_dist)
+
+            rollout_idx += 1
+
+            state = next_state
+
+        al, cl = 0.0, 0.0
+        for epoch in range(training_epochs):
+            random.shuffle(rollout)
+            for i in range(0, len(rollout), minibatch_size):
+                minibatch = rollout[i:i + minibatch_size]
+                actor_loss, critic_loss = agent.train(minibatch, device)
+                al += actor_loss
+                cl += critic_loss
+
+        al /= training_epochs
+        cl /= training_epochs
+        global_step += 1
+        writer.add_scalar("Actor Loss", al, global_step)
+        writer.add_scalar("Critic Loss", cl, global_step)
+
+        if episode % save_model_freq == 0:
+            torch.save(agent.model.state_dict(), f"models/{agent.model_name}.pth")
+            print("Saved model!")
+
+
+        # Print episode results
+        print(f"Episode: {episode}, Total Reward: {game.get_total_reward()}, Epsilon: {epsilon}")
+        writer.add_scalar("Total Reward", game.get_total_reward(), episode)
+
+
+    game.close()
+    writer.close()
+
 def main():
     # Create VizDoom environment
     game = vzd.DoomGame()
@@ -391,5 +512,6 @@ args = {
 if __name__ == '__main__':
     #TrainActorCritic()
     #main()
-    TrainActorCriticPPO()
+    #TrainActorCriticPPO()
+    TrainActorCriticPPOLSTM()
     cv2.destroyAllWindows()
