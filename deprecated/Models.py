@@ -134,7 +134,7 @@ class ActorCriticModel(nn.Module):
 
 
 class ActorCriticModelLSTM(nn.Module):
-    def __init__(self, num_actions, c1=32, c2=32, c3=32, hidden_size=128):
+    def __init__(self, num_actions, c1=16, c2=24, c3=32, hidden_size=128):
         super(ActorCriticModelLSTM, self).__init__()
         print("Running A2C")
 
@@ -163,15 +163,15 @@ class ActorCriticModelLSTM(nn.Module):
         self.lstm = nn.LSTM(self.img_size, self.hidden_size, batch_first=True, num_layers=1)
 
         self.actor = nn.Sequential(
-            nn.Linear(self.hidden_size, 100),
+            nn.Linear(self.hidden_size, 256),
             nn.ReLU(),
-            nn.Linear(100, num_actions)
+            nn.Linear(256, num_actions)
         )
 
         self.critic = nn.Sequential(
-            nn.Linear(self.hidden_size, 100),
+            nn.Linear(self.hidden_size, 256),
             nn.ReLU(),
-            nn.Linear(100, 1)
+            nn.Linear(256, 1)
         )
 
     def forward(self, x):
@@ -187,7 +187,6 @@ class ActorCriticModelLSTM(nn.Module):
         x = self.conv2(x)
         x = self.conv3(x)
         x = x.view(batch_size, timesteps, -1)
-        #x = x.view(-1, self.img_size)
 
         h0 = torch.zeros(1, batch_size, self.hidden_size).to(main.device)
         c0 = torch.zeros(1, batch_size, self.hidden_size).to(main.device)

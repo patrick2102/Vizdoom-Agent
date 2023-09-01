@@ -2,13 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-import vizdoom as vzd
 import Models
-from collections import deque
-import random
-from torch.utils.tensorboard import SummaryWriter
-
-import main
 
 
 class HyperParameters:
@@ -114,7 +108,7 @@ class ActorCriticAgent:
         log_probs = torch.log(prob_dists)
 
 
-        actor_loss = -(log_probs * advantage).mean()
+        actor_loss = (-log_probs * advantage).mean()
         critic_loss = hp.criterion(state_values, target_q_values).mean()
 
         loss = actor_loss + critic_loss
@@ -131,7 +125,7 @@ class ActorCriticAgent:
 
 
 class ActorCriticAgentPPO:
-    def __init__(self, model, model_name, hyper_parameters):
+    def __init__(self, model, model_name, hyper_parameters, device):
         self.frame_stack_size = 10
         self.memory_idx = 0
         self.exploration_decay = 0.9995
@@ -141,6 +135,27 @@ class ActorCriticAgentPPO:
         self.device = "cpu"
         if torch.cuda.is_available():
             self.device = "cuda:0"
+
+        model_name = "ActorCriticPPOLSTM"
+
+        actorCriticModel = Models.ActorCriticModelLSTM(num_actions).float().to(device)
+
+        # if model exists, load it
+        if os.path.exists("models/" + model_name + ".pth"):
+            actorCriticModel.load_state_dict(torch.load("models/" + model_name + ".pth"), strict=False)
+            print("Loaded model")
+
+        learning_rates = [{'params': actorCriticModel.conv1.parameters(), 'lr': 1e-4},
+                          {'params': actorCriticModel.conv2.parameters(), 'lr': 1e-4},
+                          {'params': actorCriticModel.conv3.parameters(), 'lr': 1e-4},
+                          {'params': actorCriticModel.lstm.parameters(), 'lr': 1e-4},
+                          {'params': actorCriticModel.actor.parameters(), 'lr': 1e-4},
+                          {'params': actorCriticModel.critic.parameters(), 'lr': 1e-4}]
+        optimizer = optim.Adam(learning_rates)
+
+        criterion = nn.MSELoss().to(device)
+        # Initialize hyperparameters
+        hyperParameters = HyperParameters(optimizer=optimizer, criterion=criterion)
 
     def train(self, minibatch, device):
         states, actions, rewards, next_states, dones, old_prop_dist = zip(*minibatch)
@@ -200,7 +215,15 @@ class ActorCriticAgentPPO:
         old_prop_dist[row] = prob_dists.detach()
         return actor_loss.item(), critic_loss.item()
 
+    def add_to_rollout(self, episode, state, action, reward, next_state, done):
+        episode.states.append(state)
+        episode.actions.append(action)
+        episode.rewards.append(reward)
+        episode.next_states.append(next_state)
+        episode.dones.append(done)
+
     def get_action(self, state):
+        state = torch.unsqueeze(state, 0)
         with torch.no_grad():
             prop_dist, state_value = self.model.forward(state)
 
@@ -221,26 +244,21 @@ class ActorCriticAgentPPOLSTM:
 
     def train(self, minibatch, device):
         states, actions, rewards, next_states, dones, old_prop_dist = zip(*minibatch)
-        dones = torch.tensor(dones, dtype=torch.float32).to(device)
-
         minibatch_size = len(minibatch)
 
-        hp = self.hp
         states = torch.cat(states).to(device)
-        #states = states.unsqueeze(1)
+        actions = torch.tensor(actions).to(device)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+        next_states = torch.cat(next_states).to(device)
+        dones = torch.tensor(dones, dtype=torch.float32).to(device)
 
         if len(states.shape) == 1:
             states = states.unsqueeze(0)
 
-        actions = torch.tensor(actions).to(device)
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-        next_states = torch.cat(next_states).to(device)
-
         if len(next_states.shape) == 1:
             next_states = next_states.unsqueeze(0)
 
-        #next_states = next_states.unsqueeze(1)
-        #old_prop_dist = torch.tensor(old_prop_dist, dtype=torch.float32).to(device)
+        hp = self.hp
 
         row = np.arange(minibatch_size)
 
@@ -250,10 +268,6 @@ class ActorCriticAgentPPOLSTM:
 
         if len(prob_dists.shape) == 1:
             prob_dists = prob_dists.unsqueeze(0)
-
-
-
-        #print("prob_dists shape:", prob_dists.shape)
 
         with torch.no_grad():
             _, next_state_values = self.model.forward(next_states)
@@ -289,6 +303,6 @@ class ActorCriticAgentPPOLSTM:
 
     def get_action(self, state):
         with torch.no_grad():
-            prop_dist, state_value = self.model.forward(state)
+            prop_dist, state_value = self.model.forward(state.to(self.device))
 
         return prop_dist.argmax().item(), prop_dist.detach()
